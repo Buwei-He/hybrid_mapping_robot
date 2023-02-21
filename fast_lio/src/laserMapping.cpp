@@ -60,24 +60,10 @@
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
-#include <image_transport/image_transport.h>
-#include <opencv2/imgproc/imgproc.hpp>
-#include <opencv2/highgui/highgui.hpp>
-#include <cv_bridge/cv_bridge.h>
-#include <sensor_msgs/image_encodings.h>
-#include <sensor_msgs/Image.h>
-#include <sensor_msgs/CameraInfo.h>
-
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
-
-using namespace std;
-
-/** fisheye image **/
-cv::Mat img;
-int img_idx = 0;
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -90,6 +76,7 @@ bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extri
 float res_last[100000] = {0.0};
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
+double time_diff_lidar_to_imu = 0.0;
 
 mutex mtx_buffer;
 condition_variable sig_buffer;
@@ -209,7 +196,7 @@ void pointBodyToWorld(const Matrix<T, 3, 1> &pi, Matrix<T, 3, 1> &po)
     po[2] = p_global(2);
 }
 
-void IntensitypointBodyToWorld(PointType const * const pi, PointType * const po)
+void RGBpointBodyToWorld(PointType const * const pi, PointType * const po)
 {
     V3D p_body(pi->x, pi->y, pi->z);
     V3D p_global(state_point.rot * (state_point.offset_R_L_I*p_body + state_point.offset_T_L_I) + state_point.pos);
@@ -218,58 +205,6 @@ void IntensitypointBodyToWorld(PointType const * const pi, PointType * const po)
     po->y = p_global(1);
     po->z = p_global(2);
     po->intensity = pi->intensity;
-}
-
-Params params;
-/** use camera to colorize the published point cloud **/
-void RGBpointBodyToWorld(PointType const * const pi, PointRgbType * const po)
-{
-    V3D p_body(pi->x, pi->y, pi->z);
-    V3D p_global(state_point.rot * (state_point.offset_R_L_I*p_body + state_point.offset_T_L_I) + state_point.pos);
-
-    po->x = p_global(0);
-    po->y = p_global(1);
-    po->z = p_global(2);
-
-    /** project to the fisheye camera and get the rgb value **/
-    /** extrinsic transformation **/
-    Eigen::Vector3d point_vec;
-    Eigen::Vector3d point_trans_vec;
-    point_vec << pi->x, pi->y, pi->z;
-    point_trans_vec = params.R * point_vec + params.translation;
-
-    /** intrinsic transformation **/
-    Eigen::Vector2d uv_vec;
-    Eigen::Matrix2d affine_inv;
-    double theta, uv_radius, xy_radius;
-    theta = acos(point_trans_vec(2) / sqrt((point_trans_vec(0) * point_trans_vec(0)) + (point_trans_vec(1) * point_trans_vec(1)) + (point_trans_vec(2) * point_trans_vec(2))));
-    uv_radius = params.a_(0) + params.a_(1) * theta + params.a_(2) * pow(theta, 2) + params.a_(3) * pow(theta, 3) + params.a_(4) * pow(theta, 4);
-    xy_radius = sqrt(point_trans_vec(1) * point_trans_vec(1) + point_trans_vec(0) * point_trans_vec(0));
-    uv_vec = {uv_radius / xy_radius * point_trans_vec(0) + params.uv_0(0), uv_radius / xy_radius * point_trans_vec(1) + params.uv_0(1)};
-    affine_inv.row(0) << params.affine(1, 1) / (params.affine(0, 0) * params.affine(1, 1) - params.affine(1, 0) * params.affine(0, 1)),
-            - params.affine(0, 1) / (params.affine(0, 0) * params.affine(1, 1) - params.affine(1, 0) * params.affine(0, 1));
-    affine_inv.row(1) << - params.affine(1, 0) / (params.affine(0, 0) * params.affine(1, 1) - params.affine(1, 0) * params.affine(0, 1)),
-            params.affine(0, 0) / (params.affine(0, 0) * params.affine(1, 1) - params.affine(1, 0) * params.affine(0, 1));
-    uv_vec = affine_inv * uv_vec;
-
-//    std::cout << point_vec << "\n" << point_trans_vec << std::endl;
-//    std::cout << "theta: " << theta << " xy_radius: " << xy_radius << std::endl;
-//    std::cout << "u: " << uv_vec[0] << " v: " << uv_vec[1] << " radius: " << uv_radius << std::endl;
-
-    //if image_point is within the frame
-    if (0 <= uv_vec[0] && uv_vec[0] < img.rows && 0 <= uv_vec[1] && uv_vec[1] < img.cols) {
-        if (uv_radius > 400 & uv_radius < 1000) {
-            po->b = img.at<cv::Vec3b>(uv_vec[0], uv_vec[1])[0];
-            po->g = img.at<cv::Vec3b>(uv_vec[0], uv_vec[1])[1];
-            po->r = img.at<cv::Vec3b>(uv_vec[0], uv_vec[1])[2];
-//            std::cout << "Use img: " << img_idx << std::endl;
-        }
-    }
-    else {
-        po->b = 255;
-        po->g = 255;
-        po->r = 255;
-    }
 }
 
 void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
@@ -403,6 +338,7 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
 
+    msg->header.stamp = ros::Time().fromSec(msg_in->header.stamp.toSec() - time_diff_lidar_to_imu);
     if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
     {
         msg->header.stamp = \
@@ -424,22 +360,6 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
-}
-
-void img_cbk(const sensor_msgs::ImageConstPtr& msg)
-{
-    try
-    {
-        cv_bridge::CvImagePtr cv_ptr;
-        cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-        cv_ptr->image.copyTo(img);
-        img_idx ++;
-        std::cout << "Subcribe img: " << img_idx << std::endl;
-    }
-    catch (cv_bridge::Exception& e)
-    {
-        ROS_ERROR("Could not convert from '%s' to 'bgr8'.", msg->encoding.c_str());
-    }
 }
 
 double lidar_mean_scantime = 0.0;
@@ -548,34 +468,25 @@ void map_incremental()
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
 
-/** the fuction where to add the rgb of point cloud **/
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
-//PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-PointCloudXYZRGB::Ptr pcl_wait_save_rgb(new PointCloudXYZRGB());
-
+PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
 {
     if(scan_pub_en)
     {
-        PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body); /** if dense_pub_enb true, use feats_undistort **/
+        PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
         int size = laserCloudFullRes->points.size();
-        std::cout << "size of feats_undistort: " << size << std::endl;
-        std::cout << "p_imu_process: " << &feats_undistort->points[0].x << " " << &feats_undistort->points[0].y << " " << &feats_undistort->points[0].z << std::endl;
-
-//        PointCloudXYZI::Ptr laserCloudWorld( \
-//                        new PointCloudXYZI(size, 1));
-
-        PointCloudXYZRGB::Ptr laserRgbCloudWorld(new PointCloudXYZRGB(size, 1));
+        PointCloudXYZI::Ptr laserCloudWorld( \
+                        new PointCloudXYZI(size, 1));
 
         for (int i = 0; i < size; i++)
         {
-//            IntensitypointBodyToWorld(&laserCloudFullRes->points[i], \
-//                                &laserCloudWorld->points[i]);
-            RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserRgbCloudWorld->points[i]);
+            RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
+                                &laserCloudWorld->points[i]);
         }
 
         sensor_msgs::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*laserRgbCloudWorld, laserCloudmsg);
+        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
         laserCloudmsg.header.frame_id = "camera_init";
         pubLaserCloudFull.publish(laserCloudmsg);
@@ -588,45 +499,28 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
     if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
-//        PointCloudXYZI::Ptr laserCloudWorld( \
-//                        new PointCloudXYZI(size, 1));
-        PointCloudXYZRGB::Ptr laserRgbCloudWorld(new PointCloudXYZRGB(size, 1));
+        PointCloudXYZI::Ptr laserCloudWorld( \
+                        new PointCloudXYZI(size, 1));
 
         for (int i = 0; i < size; i++)
         {
-//            IntensitypointBodyToWorld(&feats_undistort->points[i], \
-//                                &laserCloudWorld->points[i]);
             RGBpointBodyToWorld(&feats_undistort->points[i], \
-                                &laserRgbCloudWorld->points[i]);
+                                &laserCloudWorld->points[i]);
         }
-//        *pcl_wait_save += *laserCloudWorld;
-//        static int scan_wait_num = 0;
-//        scan_wait_num ++;
-//        if (pcl_wait_save->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
-//        {
-//            pcd_index ++;
-//            string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
-//            pcl::PCDWriter pcd_writer;
-//            cout << "current scan saved to /PCD/" << all_points_dir << endl;
-//            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-//            pcl_wait_save->clear();
-//            scan_wait_num = 0;
-//        }
+        *pcl_wait_save += *laserCloudWorld;
 
-        *pcl_wait_save_rgb += *laserRgbCloudWorld;
         static int scan_wait_num = 0;
         scan_wait_num ++;
-        if (pcl_wait_save_rgb->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
+        if (pcl_wait_save->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
         {
             pcd_index ++;
             string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
             pcl::PCDWriter pcd_writer;
             cout << "current scan saved to /PCD/" << all_points_dir << endl;
-            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save_rgb);
-            pcl_wait_save_rgb->clear();
+            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+            pcl_wait_save->clear();
             scan_wait_num = 0;
         }
-
     }
 }
 
@@ -649,21 +543,21 @@ void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
     publish_count -= PUBFRAME_PERIOD;
 }
 
-//void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
-//{
-//    PointCloudXYZI::Ptr laserCloudWorld( \
-//                    new PointCloudXYZI(effct_feat_num, 1));
-//    for (int i = 0; i < effct_feat_num; i++)
-//    {
-//        IntensitypointBodyToWorld(&laserCloudOri->points[i], \
-//                            &laserCloudWorld->points[i]);
-//    }
-//    sensor_msgs::PointCloud2 laserCloudFullRes3;
-//    pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
-//    laserCloudFullRes3.header.stamp = ros::Time().fromSec(lidar_end_time);
-//    laserCloudFullRes3.header.frame_id = "camera_init";
-//    pubLaserCloudEffect.publish(laserCloudFullRes3);
-//}
+void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
+{
+    PointCloudXYZI::Ptr laserCloudWorld( \
+                    new PointCloudXYZI(effct_feat_num, 1));
+    for (int i = 0; i < effct_feat_num; i++)
+    {
+        RGBpointBodyToWorld(&laserCloudOri->points[i], \
+                            &laserCloudWorld->points[i]);
+    }
+    sensor_msgs::PointCloud2 laserCloudFullRes3;
+    pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
+    laserCloudFullRes3.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laserCloudFullRes3.header.frame_id = "camera_init";
+    pubLaserCloudEffect.publish(laserCloudFullRes3);
+}
 
 void publish_map(const ros::Publisher & pubLaserCloudMap)
 {
@@ -677,7 +571,6 @@ void publish_map(const ros::Publisher & pubLaserCloudMap)
 template<typename T>
 void set_posestamp(T & out)
 {
-    cout << "-----set_posestamp-----" << endl;
     out.pose.position.x = state_point.pos(0);
     out.pose.position.y = state_point.pos(1);
     out.pose.position.z = state_point.pos(2);
@@ -685,11 +578,11 @@ void set_posestamp(T & out)
     out.pose.orientation.y = geoQuat.y;
     out.pose.orientation.z = geoQuat.z;
     out.pose.orientation.w = geoQuat.w;
+    
 }
 
 void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 {
-    cout << "-----publish_odometry-----" << endl;
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
@@ -723,19 +616,18 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 
 void publish_path(const ros::Publisher pubPath)
 {
-    cout << "-----publish_path-----" << endl;
     set_posestamp(msg_body_pose);
     msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
     msg_body_pose.header.frame_id = "camera_init";
 
-    /*** if path is too large, the rviz will crash ***/
-//    static int jjj = 0;
-//    jjj++;
-//    if (jjj % 10 == 0)
-//    {
-          path.poses.push_back(msg_body_pose);
-//        pubPath.publish(path);
-//    }
+    /*** if path is too large, the rvis will crash ***/
+    static int jjj = 0;
+    jjj++;
+    if (jjj % 10 == 0) 
+    {
+        path.poses.push_back(msg_body_pose);
+        pubPath.publish(path);
+    }
 }
 
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
@@ -870,6 +762,7 @@ int main(int argc, char** argv)
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
     nh.param<string>("common/imu_topic", imu_topic,"/livox/imu");
     nh.param<bool>("common/time_sync_en", time_sync_en, false);
+    nh.param<double>("common/time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
     nh.param<double>("filter_size_corner",filter_size_corner_min,0.5);
     nh.param<double>("filter_size_surf",filter_size_surf_min,0.5);
     nh.param<double>("filter_size_map",filter_size_map_min,0.5);
@@ -946,12 +839,8 @@ int main(int argc, char** argv)
         nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
         nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
-
-    image_transport::ImageTransport it(nh);
-    image_transport::Subscriber sub_img = it.subscribe("camera/image_raw", 200000, img_cbk);
-
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
-            ("/cloud_registered", 100000); /** active **/
+            ("/cloud_registered", 100000);
     ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered_body", 100000);
     ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>
@@ -963,7 +852,6 @@ int main(int argc, char** argv)
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
 //------------------------------------------------------------------------------------------------------
-    static int count; /** count of the publish func **/
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
     bool status = ros::ok();
@@ -990,8 +878,7 @@ int main(int argc, char** argv)
             svd_time   = 0;
             t0 = omp_get_wtime();
 
-            p_imu->Process(Measures, kf, feats_undistort); /** get the feats_undistort points **/
-
+            p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
@@ -1083,18 +970,7 @@ int main(int argc, char** argv)
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
-            if (path_en) {
-                publish_path(pubPath);
-                count ++;
-                if (count % 10 == 0) {
-                    pubPath.publish(path);
-                    cout << msg_body_pose.header.stamp << endl;
-                    cout << path.poses.at(path.poses.size() - 1).pose.position.x << endl;
-                    cout << path.poses[path.poses.size() - 1].pose.orientation.x << endl;
-                    cout << msg_body_pose.pose.position.x << endl;
-                    cout << msg_body_pose.pose.orientation.x << endl;
-                }
-            }
+            if (path_en)                         publish_path(pubPath);
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
             // publish_effect_world(pubLaserCloudEffect);
@@ -1138,22 +1014,13 @@ int main(int argc, char** argv)
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. pcd save will largely influence the real-time performences **/
-
-//    if (pcl_wait_save->size() > 0 && pcd_save_en)
-//    {
-//        string file_name = string("scans.pcd");
-//        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
-//        pcl::PCDWriter pcd_writer;
-//        cout << "current scan saved to /PCD/" << file_name<<endl;
-//        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-//    }
-    if (pcl_wait_save_rgb->size() > 0 && pcd_save_en)
+    if (pcl_wait_save->size() > 0 && pcd_save_en)
     {
         string file_name = string("scans.pcd");
         string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
         pcl::PCDWriter pcd_writer;
         cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save_rgb);
+        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
     }
 
     fout_out.close();
@@ -1166,7 +1033,7 @@ int main(int argc, char** argv)
         string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
         fp2 = fopen(log_dir.c_str(),"w");
         fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
-        for (int i = 0;i<time_log_counter; i++) {
+        for (int i = 0;i<time_log_counter; i++){
             fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
             t.push_back(T1[i]);
             s_vec.push_back(s_plot9[i]);

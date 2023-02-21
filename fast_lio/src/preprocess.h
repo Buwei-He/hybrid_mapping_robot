@@ -2,18 +2,13 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <livox_ros_driver/CustomMsg.h>
-#include <opencv2/opencv.hpp>
-#include <opencv2/core/core.hpp>
-#include <Eigen/Core>
 
 using namespace std;
 
 #define IS_VALID(a)  ((abs(a)>1e8) ? true : false)
 
 typedef pcl::PointXYZINormal PointType;
-typedef pcl::PointXYZRGB PointRgbType;
 typedef pcl::PointCloud<PointType> PointCloudXYZI;
-typedef pcl::PointCloud<PointRgbType> PointCloudXYZRGB;
 
 enum LID_TYPE{AVIA = 1, VELO16, OUST64}; //{1, 2, 3}
 enum TIME_UNIT{SEC = 0, MS = 1, US = 2, NS = 3};
@@ -126,31 +121,4 @@ class Preprocess
   double edgea, edgeb;
   double smallp_intersect, smallp_ratio;
   double vx, vy, vz;
-};
-
-class Params
-{
-public:
-    Params ();
-    /** load fisheye image, extrinsic and intrinsic parameters **/
-    /** load fisheye image **/
-    std::string img_path = "/home/godm/catkin_ws/src/lidar_fisheye_fusion_github/calibration/data/lh3_global/spot0/0/images/grab_0.bmp";
-    cv::Mat img = cv::imread(img_path, cv::IMREAD_UNCHANGED);
-    /** extrinsic transformation **/
-    double tx = 0.277415;
-    double ty = -0.0112217;
-    double tz = 0.046939;
-    double rx = 0.00326059;
-    double ry = 3.13658;
-    double rz = 1.56319;
-
-    Eigen::Vector3d translation;
-    Eigen::Vector3d euler;
-    Eigen::Matrix3d R;
-
-    /** intrinsic transformation **/
-    Eigen::VectorXd intrinsic_vec = Eigen::VectorXd(10);
-    Eigen::Vector2d uv_0;
-    Eigen::VectorXd a_ = Eigen::VectorXd(5);
-    Eigen::Matrix2d affine;
 };

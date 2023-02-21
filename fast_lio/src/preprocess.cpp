@@ -3,24 +3,6 @@
 #define RETURN0     0x00
 #define RETURN0AND1 0x10
 
-Params::Params() {
-    this->translation << tx, ty, tz;
-    this->euler << rz, ry, rx;
-    this->R = Eigen::AngleAxisd(euler[0], Eigen::Vector3d::UnitZ())
-        * Eigen::AngleAxisd(euler[1], Eigen::Vector3d::UnitY())
-        * Eigen::AngleAxisd(euler[2], Eigen::Vector3d::UnitX());
-
-    this->intrinsic_vec <<1022.53, 1198.45, // u0 v0
-            1880.36, -536.721, -12.9298, -18.0154, 5.6414, // a0 - a4
-            1.00176, -0.00863924, 0.00846056; // c d e
-    this->uv_0 << intrinsic_vec(0), intrinsic_vec(1);
-    this->a_ << intrinsic_vec(2), intrinsic_vec(3), intrinsic_vec(4), intrinsic_vec(5), intrinsic_vec(6);
-    this->affine << intrinsic_vec(7), intrinsic_vec(8), intrinsic_vec(9), 1.0;
-
-//    std::cout << "Rotation Matrix: " << this->R << "\n" << std::endl;
-//    std::cout << "Translation Vector: " << this->translation << "\n" << std::endl;
-}
-
 Preprocess::Preprocess()
   :feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
 {
